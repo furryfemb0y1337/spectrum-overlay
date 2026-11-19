@@ -4,7 +4,11 @@ use std::sync::Arc;
 pub const POINTS: usize = 512;
 pub const DETAIL_POINTS: [usize; 3] = [64, 192, POINTS];
 pub const HIGH_DETAIL: usize = DETAIL_POINTS.len() - 1;
-pub const HISTORY: usize = 65536;
+const REFERENCE_WINDOW: usize = 65536;
+pub fn history_frames(rate: u32) -> usize {
+    let ideal = REFERENCE_WINDOW as f64 * rate as f64 / 96_000.;
+    1usize << (ideal.log2().round().clamp(10., 20.) as u32)
+}
 
 struct Band {
     fft: Arc<dyn Fft<f32>>,
@@ -28,11 +32,12 @@ impl Band {
     }
     fn analyze(&mut self, history: &[f32], end: usize, channels: usize) {
         let n = self.bins.len();
+        let history_frames = history.len() / channels;
         self.power.fill(0.);
         for channel in 0..channels {
             for i in 0..n {
                 self.bins[i] = Complex32::new(
-                    history[((end + HISTORY - n + i) % HISTORY) * channels + channel]
+                    history[((end + history_frames - n + i) % history_frames) * channels + channel]
                         * self.window[i],
                     0.,
                 );
@@ -70,12 +75,13 @@ pub struct Analyzer {
     bands: [Band; 3],
 }
 impl Analyzer {
-    pub fn new(detail: usize) -> Self {
+    pub fn new(detail: usize, rate: u32) -> Self {
         let mut planner = FftPlanner::new();
         let divisor = 1 << (HIGH_DETAIL - detail);
         Self {
             detail,
-            bands: [65536, 16384, 4096].map(|n| Band::new(n / divisor, &mut planner)),
+            bands: [1, 4, 16]
+                .map(|ratio| Band::new(history_frames(rate) / (divisor * ratio), &mut planner)),
         }
     }
     pub fn frame(&mut self, h: &[f32], end: usize, channels: usize, rate: f32) -> [f32; POINTS] {
@@ -102,11 +108,11 @@ mod tests {
     use super::*;
     #[test]
     fn detail_presets_keep_tone_on_frequency_axis() {
-        let samples: Vec<_> = (0..HISTORY)
+        let samples: Vec<_> = (0..history_frames(48000))
             .map(|i| (std::f32::consts::TAU * 1500. * i as f32 / 48000.).sin())
             .collect();
         for (detail, columns) in DETAIL_POINTS.into_iter().enumerate() {
-            let mut analyzer = Analyzer::new(detail);
+            let mut analyzer = Analyzer::new(detail, 48000);
             let frame = analyzer.frame(&samples, 123, 1, 48000.);
             let peak = (0..columns)
                 .max_by(|a, b| {
@@ -127,9 +133,32 @@ mod tests {
         }
     }
     #[test]
+    fn native_rates_cover_upper_octave() {
+        for rate in [
+            8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400,
+            192000, 352800, 384000,
+        ] {
+            let mut analyzer = Analyzer::new(HIGH_DETAIL, rate);
+            let samples: Vec<_> = (0..history_frames(rate))
+                .map(|i| (std::f64::consts::TAU * 0.4375 * i as f64).sin() as f32)
+                .collect();
+            let frame = analyzer.frame(&samples, 0, 1, rate as f32);
+            let (i, peak) = frame
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap();
+            let center = frequency((i as f32 + 0.5) / POINTS as f32, rate as f32);
+            assert!(
+                *peak > 0.98 && (center / rate as f32 - 0.4375).abs() < 0.006,
+                "rate {rate}"
+            );
+        }
+    }
+    #[test]
     fn surround_center_tone() {
-        let mut analyzer = Analyzer::new(HIGH_DETAIL);
-        let mut samples = vec![0.; HISTORY * 6];
+        let mut analyzer = Analyzer::new(HIGH_DETAIL, 48000);
+        let mut samples = vec![0.; history_frames(48000) * 6];
         for (i, frame) in samples.chunks_exact_mut(6).enumerate() {
             frame[2] = (std::f32::consts::TAU * 750. * i as f32 / 48000.).sin();
         }
@@ -144,9 +173,9 @@ mod tests {
     }
     #[test]
     fn full_band_antiphase() {
-        let mut analyzer = Analyzer::new(HIGH_DETAIL);
+        let mut analyzer = Analyzer::new(HIGH_DETAIL, 96000);
         for f in [30., 1000., 20000., 30000., 47000.] {
-            let h = (0..HISTORY)
+            let h = (0..history_frames(96000))
                 .flat_map(|i| {
                     let v = (std::f32::consts::TAU * f * i as f32 / 96000.).sin();
                     [v, -v]

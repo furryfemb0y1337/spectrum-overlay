@@ -1,4 +1,4 @@
-use crate::spectrum::{Analyzer, HISTORY, POINTS};
+use crate::spectrum::{history_frames, Analyzer, POINTS};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, SampleFormat, SizedSample, Stream, StreamConfig,
@@ -37,7 +37,7 @@ where
         None,
     )
 }
-fn session(display: &Display, analyzer: &mut Analyzer) -> Result<(), Box<dyn std::error::Error>> {
+fn session(display: &Display) -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -63,8 +63,9 @@ fn session(display: &Display, analyzer: &mut Analyzer) -> Result<(), Box<dyn std
         _ => return Err("Неподдерживаемый формат звука".into()),
     };
     stream.play()?;
-    *STATUS_CHANGE.lock().unwrap() = Some(format!("Захват — {name}"));
-    let mut history = vec![0.; HISTORY * channels];
+    *STATUS_CHANGE.lock().unwrap() = Some(format!("Захват — {name}, {rate} Гц"));
+    let mut analyzer = Analyzer::new(DETAIL.load(Ordering::Relaxed), rate);
+    let mut history = vec![0.; history_frames(rate) * channels];
     *display.lock().unwrap() = (rate, [0.; POINTS]);
     let mut silent = true;
     let mut end = 0;
@@ -102,7 +103,7 @@ fn session(display: &Display, analyzer: &mut Analyzer) -> Result<(), Box<dyn std
             if VISIBLE.load(Ordering::Relaxed) {
                 let detail = DETAIL.load(Ordering::Relaxed);
                 if analyzer.detail != detail {
-                    *analyzer = Analyzer::new(detail);
+                    analyzer = Analyzer::new(detail, rate);
                 }
                 let frame = analyzer.frame(&history, end / channels, channels, rate as f32);
                 *display.lock().unwrap() = (rate, frame);
@@ -115,9 +116,8 @@ fn session(display: &Display, analyzer: &mut Analyzer) -> Result<(), Box<dyn std
     }
 }
 pub fn run(display: Display) {
-    let mut analyzer = Analyzer::new(DETAIL.load(Ordering::Relaxed));
     loop {
-        if let Err(e) = session(&display, &mut analyzer) {
+        if let Err(e) = session(&display) {
             *STATUS_CHANGE.lock().unwrap() = Some(format!("Захват недоступен — {e}"));
         }
         display.lock().unwrap().1.fill(0.);
